@@ -23,53 +23,68 @@ handler = SlackRequestHandler(app)
 # --- LÓGICA DEL BOT ---
 
 def flujo_pregunta_respuesta(pregunta):
-    # 1. EL "MAPA" DETALLADO (Contexto es Rey)
+    """
+    Proceso: Lenguaje Natural -> SQL -> Supabase -> Respuesta Humana
+    """
+    
+    # 1. ESQUEMA DETALLADO Y REGLAS DE NEGOCIO (MENORCA CONTEXT)
     esquema_detallado = """
-    Tablas del esquema 'public':
-    - Person: id, full_name, email, startup_id (FK), expertise_tags (jsonb), contact_type, arrival_date, departure_date.
-    - Startup: id, name, sector, stage, website_url.
-    - Event: id, title, description, start_time, location, speaker_id (FK).
-    - UserEvent: user_id (FK a Person), event_id (FK a Event).
-    - OneOnOne: startup_id, person_id, start_time, location.
+    CONTEXTO: Base de datos de un programa de emprendimiento en MENORCA.
+    
+    TABLAS:
+    - public.Person: id, full_name, email, contact_type, expertise_tags (jsonb), startup_id, arrival_date, departure_date.
+      * Valores contact_type: 'experience_maker', 'team', 'vc', 'founder', 'staff'.
+    - public.Startup: id, name, sector, stage.
+    - public.Event: id, title, description, location, start_time, speaker_id.
+    - public.UserEvent: user_id, event_id (Relaciona personas con asistencia a eventos).
 
-    Relaciones importantes:
-    - Para saber quién asiste a un evento: Person -> UserEvent -> Event.
-    - Para saber de qué startup es una persona: Person.startup_id = Startup.id.
-    - Para saber quién dio una charla: Event.speaker_id = Person.id.
+    REGLAS DE SQL:
+    - "Experience Makers" -> contact_type = 'experience_maker'.
+    - Ubicación -> Si mencionan lugares de Menorca, buscar en public.Event.location.
+    - "Hoy" -> Usar CURRENT_DATE.
+    - Para filtrar por expertise_tags (JSONB), usar: expertise_tags ? 'Valor'.
+    - Usar siempre ILIKE para textos y LIMIT 20.
+    - Responder SOLO con el código SQL puro.
     """
 
-    instrucciones_sql = f"""
-    Eres un experto en PostgreSQL para Supabase. Basado en este esquema:
-    {esquema_detallado}
-
-    Reglas:
-    1. Retorna SOLO el código SQL, sin explicaciones ni bloques de código markdown.
-    2. Usa ILIKE para nombres (ej: name ILIKE '%termino%').
-    3. Si piden expertos en algo, busca dentro del campo jsonb 'expertise_tags'.
-    4. Siempre añade LIMIT 20.
-    5. Usa prefijos 'public.' para todas las tablas.
-    """
-    
-    # Llamada a Claude para generar SQL
-    res_sql = claude.messages.create(
-        model="claude-3-5-sonnet-20240620",
-        max_tokens=300,
-        system=instrucciones_sql,
-        messages=[{"role": "user", "content": pregunta}]
-    )
-    sql = res_sql.content[0].text.strip()
-    
-    # Imprimir en los logs de Railway para que puedas debugear
-    print(f"DEBUG: Pregunta: {pregunta} | SQL: {sql}")
-
-    # 2. Ejecutar en Supabase
     try:
-        db_res = supabase.rpc("exec_sql", {"query_text": sql}).execute()
-        datos = db_res.data
-        if not datos:
-            datos = "No se encontraron resultados para esa consulta."
+        # PASO A: Generar el SQL
+        res_sql = claude.messages.create(
+            model="claude-3-5-sonnet-latest",
+            max_tokens=300,
+            system=esquema_detallado,
+            messages=[{"role": "user", "content": f"Genera el SQL para: {pregunta}"}]
+        )
+        sql_query = res_sql.content[0].text.strip()
+        
+        # Log para debug en Railway
+        print(f"--- SQL GENERADO ---\n{sql_query}\n")
+
+        # PASO B: Ejecutar en Supabase vía RPC
+        db_res = supabase.rpc("exec_sql", {"query_text": sql_query}).execute()
+        datos_crudos = db_res.data
+
+        # PASO C: Traducir a respuesta humana
+        prompt_humano = f"""
+        El usuario preguntó: "{pregunta}"
+        Los datos obtenidos de la base de datos son: {datos_crudos}
+        
+        Instrucciones:
+        - Si hay datos, redacta una respuesta amable y concisa.
+        - Si no hay datos, indica que no encontraste información sobre eso.
+        - Si los datos contienen un error, explica brevemente que hubo un problema técnico.
+        """
+
+        res_final = claude.messages.create(
+            model="claude-3-5-sonnet-latest",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt_humano}]
+        )
+        return res_final.content[0].text
+
     except Exception as e:
-        return f"Ups, tuve un problema con la base de datos: {e}"
+        print(f"ERROR EN EL FLUJO: {e}")
+        return f"Lo siento, tuve un problema al procesar esa consulta. (Error: {str(e)})"
 
     # 3. Respuesta humana
     res_final = claude.messages.create(

@@ -40,15 +40,32 @@ handler = SlackRequestHandler(app)
 # --- LÓGICA DEL BOT ---
 
 
+def _normalizar_sql_generada(sql_query):
+    cleaned = (sql_query or "").strip()
+    if not cleaned:
+        return ""
+
+    # Si el modelo devuelve bloque markdown, extrae solo el contenido SQL.
+    block_match = re.search(r"```(?:sql)?\s*(.*?)\s*```", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if block_match:
+        cleaned = block_match.group(1).strip()
+
+    # Acepta ';' final (estilo común) pero elimina sentencias adicionales.
+    while cleaned.endswith(";"):
+        cleaned = cleaned[:-1].strip()
+
+    return cleaned
+
+
 def _es_sql_segura_para_lectura(sql_query):
-    cleaned = sql_query.strip()
+    cleaned = _normalizar_sql_generada(sql_query)
     if not cleaned:
         return False
     if ";" in cleaned:
         # Evita inyección por múltiples sentencias.
         return False
     lowered = cleaned.lower()
-    if not lowered.startswith("select"):
+    if not (lowered.startswith("select") or lowered.startswith("with")):
         return False
 
     blocked_patterns = [
@@ -110,7 +127,7 @@ def flujo_pregunta_respuesta(pregunta):
             system=esquema_detallado,
             messages=[{"role": "user", "content": f"Genera el SQL para: {pregunta}"}]
         )
-        sql_query = res_sql.content[0].text.strip()
+        sql_query = _normalizar_sql_generada(res_sql.content[0].text)
         
         # Log para debug en Railway
         print(f"--- SQL GENERADO ---\n{sql_query}\n")

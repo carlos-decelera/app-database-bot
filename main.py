@@ -26,7 +26,7 @@ def flujo_pregunta_respuesta(pregunta):
     # 1. EL "MAPA" DETALLADO (Contexto es Rey)
     esquema_detallado = """
     Tablas del esquema 'public':
-    - Person: id, full_name, email, startup_id (FK), expertise_tags (jsonb), contact_type, arrival_date.
+    - Person: id, full_name, email, startup_id (FK), expertise_tags (jsonb), contact_type, arrival_date, departure_date.
     - Startup: id, name, sector, stage, website_url.
     - Event: id, title, description, start_time, location, speaker_id (FK).
     - UserEvent: user_id (FK a Person), event_id (FK a Event).

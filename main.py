@@ -1,4 +1,5 @@
 import os
+import re
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
@@ -7,6 +8,21 @@ from anthropic import Anthropic
 from supabase import create_client
 
 load_dotenv()
+
+# Validación temprana de variables críticas para evitar fallos opacos en runtime.
+REQUIRED_ENV_VARS = [
+    "ANTHROPIC_API_KEY",
+    "SUPABASE_URL",
+    "SUPABASE_KEY",
+    "CLAUDE_MODEL",
+    "SLACK_BOT_TOKEN",
+    "SLACK_SIGNING_SECRET",
+]
+missing_env_vars = [name for name in REQUIRED_ENV_VARS if not os.getenv(name)]
+if missing_env_vars:
+    raise RuntimeError(
+        "Faltan variables de entorno requeridas: " + ", ".join(missing_env_vars)
+    )
 
 # Inicialización de clientes
 claude = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
@@ -22,6 +38,40 @@ flask_app = Flask(__name__)
 handler = SlackRequestHandler(app)
 
 # --- LÓGICA DEL BOT ---
+
+
+def _es_sql_segura_para_lectura(sql_query):
+    cleaned = sql_query.strip()
+    if not cleaned:
+        return False
+    if ";" in cleaned:
+        # Evita inyección por múltiples sentencias.
+        return False
+    lowered = cleaned.lower()
+    if not lowered.startswith("select"):
+        return False
+
+    blocked_patterns = [
+        r"\binsert\b",
+        r"\bupdate\b",
+        r"\bdelete\b",
+        r"\bdrop\b",
+        r"\balter\b",
+        r"\btruncate\b",
+        r"\bcreate\b",
+        r"\bgrant\b",
+        r"\brevoke\b",
+    ]
+    return not any(re.search(pattern, lowered) for pattern in blocked_patterns)
+
+
+def _extraer_texto_mencion(event):
+    text = (event.get("text") or "").strip()
+    if not text:
+        return ""
+    # Elimina menciones tipo <@U123ABC>.
+    text = re.sub(r"<@[A-Z0-9]+>", "", text).strip()
+    return text
 
 def flujo_pregunta_respuesta(pregunta):
     """
@@ -65,9 +115,22 @@ def flujo_pregunta_respuesta(pregunta):
         # Log para debug en Railway
         print(f"--- SQL GENERADO ---\n{sql_query}\n")
 
+        if not _es_sql_segura_para_lectura(sql_query):
+            print(f"SQL BLOQUEADA POR SEGURIDAD: {sql_query}")
+            return (
+                "Solo puedo ejecutar consultas de lectura seguras (SELECT sin "
+                "múltiples sentencias). Reformula la pregunta, por favor."
+            )
+
         # PASO B: Ejecutar en Supabase vía RPC
         db_res = supabase.rpc("exec_sql", {"query_text": sql_query}).execute()
-        datos_crudos = db_res.data
+        if getattr(db_res, "error", None):
+            print(f"ERROR SUPABASE RPC: {db_res.error}")
+            datos_crudos = {"error": str(db_res.error)}
+        else:
+            datos_crudos = getattr(db_res, "data", None)
+            if datos_crudos is None:
+                datos_crudos = []
 
         # PASO C: Traducir a respuesta humana
         prompt_humano = f"""
@@ -91,22 +154,20 @@ def flujo_pregunta_respuesta(pregunta):
         print(f"ERROR EN EL FLUJO: {e}")
         return f"Lo siento, tuve un problema al procesar esa consulta. (Error: {str(e)})"
 
-    # 3. Respuesta humana
-    res_final = claude.messages.create(
-        model="claude-3-5-sonnet-20240620",
-        max_tokens=500,
-        system="Eres un asistente de eventos y startups amigable. Traduce los datos de la base de datos a una respuesta natural.",
-        messages=[{"role": "user", "content": f"Usuario: {pregunta}\nDatos: {datos}"}]
-    )
-    return res_final.content[0].text
-
 # --- EVENTO DE SLACK ---
 
 @app.event("app_mention")
 def handle_mentions(event, say):
     # Obtenemos la pregunta (quitando la mención al bot)
-    texto = event['text'].split('> ')[1] if '> ' in event['text'] else event['text']
+    texto = _extraer_texto_mencion(event)
     thread_ts = event.get("ts") # Esto permite responder en el hilo
+
+    if not texto:
+        say(
+            "Escríbeme una pregunta después de mencionarme para poder ayudarte.",
+            thread_ts=thread_ts
+        )
+        return
     
     # Indicamos que estamos trabajando (opcional)
     say("Buscando en la base de datos... 🔍", thread_ts=thread_ts)

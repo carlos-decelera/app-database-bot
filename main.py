@@ -177,22 +177,41 @@ def flujo_pregunta_respuesta(pregunta):
 def handle_mentions(event, say):
     # Obtenemos la pregunta (quitando la mención al bot)
     texto = _extraer_texto_mencion(event)
-    thread_ts = event.get("ts") # Esto permite responder en el hilo
+    event_ts = event.get("ts")
+    channel_id = event.get("channel")
 
     if not texto:
-        say(
-            "Escríbeme una pregunta después de mencionarme para poder ayudarte.",
-            thread_ts=thread_ts
-        )
+        say("Escríbeme una pregunta después de mencionarme para poder ayudarte.")
         return
-    
-    # Indicamos que estamos trabajando (opcional)
-    say("Buscando en la base de datos... 🔍", thread_ts=thread_ts)
-    
-    respuesta = flujo_pregunta_respuesta(texto)
-    
-    # Respondemos en el hilo
-    say(text=respuesta, thread_ts=thread_ts)
+
+    # Indicador visual sin mensaje: reacción sobre el mensaje del usuario.
+    reaction_added = False
+    if channel_id and event_ts:
+        try:
+            app.client.reactions_add(
+                channel=channel_id,
+                timestamp=event_ts,
+                name="mag",
+            )
+            reaction_added = True
+        except Exception as reaction_error:
+            print(f"No se pudo agregar reacción de progreso: {reaction_error}")
+
+    try:
+        respuesta = flujo_pregunta_respuesta(texto)
+    finally:
+        if reaction_added and channel_id and event_ts:
+            try:
+                app.client.reactions_remove(
+                    channel=channel_id,
+                    timestamp=event_ts,
+                    name="mag",
+                )
+            except Exception as reaction_error:
+                print(f"No se pudo quitar reacción de progreso: {reaction_error}")
+
+    # Respondemos en la conversación principal (sin hilo).
+    say(text=respuesta)
 
 # --- RUTAS PARA RAILWAY ---
 

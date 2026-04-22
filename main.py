@@ -33,16 +33,20 @@ def flujo_pregunta_respuesta(pregunta):
     CONTEXTO: Base de datos de un programa de emprendimiento en MENORCA.
     
     TABLAS:
-    - public.Person: id, full_name, email, contact_type, expertise_tags (jsonb), startup_id, arrival_date, departure_date.
+    - public.Person: id, full_name, email, contact_type, expertise_tags (jsonb), startup_id, arrival_date (llegada a menorca), departure_date (salida de menorca).
       * Valores contact_type: 'experience_maker', 'team', 'vc', 'founder', 'staff'.
     - public.Startup: id, name, sector, stage.
     - public.Event: id, title, description, location, start_time, speaker_id.
     - public.UserEvent: user_id, event_id (Relaciona personas con asistencia a eventos).
 
     REGLAS DE SQL:
+    - IMPORTANTE: Usa SIEMPRE comillas dobles para los nombres de las tablas.
+        Ejemplo: public."Person", public."Startup", public."Event".
+    - Si no usas comillas dobles, la consulta fallará.
     - "Experience Makers" -> contact_type = 'experience_maker'.
     - Ubicación -> Si mencionan lugares de Menorca, buscar en public.Event.location.
     - "Hoy" -> Usar CURRENT_DATE.
+    - Para saber si alguien esté en el programa o en menorca comparar hoy con arrival_date y departure_date.
     - Para filtrar por expertise_tags (JSONB), usar: expertise_tags ? 'Valor'.
     - Usar siempre ILIKE para textos y LIMIT 20.
     - Responder SOLO con el código SQL puro.

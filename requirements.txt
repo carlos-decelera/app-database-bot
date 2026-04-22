@@ -2,4 +2,5 @@ anthropic
 supabase
 python-dotenv
 slack_bolt
+flask
 gunicorn

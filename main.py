@@ -73,7 +73,7 @@ def flujo_pregunta_respuesta(pregunta):
 
     # 3. Respuesta humana
     res_final = claude.messages.create(
-        model="claude-3-5-sonnet-latest",
+        model="claude-3-5-sonnet-20240620",
         max_tokens=500,
         system="Eres un asistente de eventos y startups amigable. Traduce los datos de la base de datos a una respuesta natural.",
         messages=[{"role": "user", "content": f"Usuario: {pregunta}\nDatos: {datos}"}]

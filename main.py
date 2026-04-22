@@ -11,6 +11,7 @@ load_dotenv()
 # Inicialización de clientes
 claude = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+model_claude = os.getenv("CLAUDE_MODEL")
 
 # Configuración de Slack
 app = App(
@@ -50,7 +51,7 @@ def flujo_pregunta_respuesta(pregunta):
     try:
         # PASO A: Generar el SQL
         res_sql = claude.messages.create(
-            model="claude-3-5-sonnet-latest",
+            model=model_claude,
             max_tokens=300,
             system=esquema_detallado,
             messages=[{"role": "user", "content": f"Genera el SQL para: {pregunta}"}]
@@ -76,7 +77,7 @@ def flujo_pregunta_respuesta(pregunta):
         """
 
         res_final = claude.messages.create(
-            model="claude-3-5-sonnet-latest",
+            model=model_claude,
             max_tokens=500,
             messages=[{"role": "user", "content": prompt_humano}]
         )

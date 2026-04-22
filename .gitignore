@@ -1,0 +1,12 @@
+# Entornos virtuales
+venv/
+env/
+__pycache__/
+*.pyc
+
+# Secretos
+.env
+
+# Railway/Logs
+.railway/
+*.log

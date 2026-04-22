@@ -95,35 +95,33 @@ def flujo_pregunta_respuesta(pregunta):
     Proceso: Lenguaje Natural -> SQL -> Supabase -> Respuesta Humana
     """
     
-    # 1. ESQUEMA DETALLADO Y REGLAS DE NEGOCIO (MENORCA CONTEXT)
+    # Prompt compacto para reducir coste, manteniendo reglas críticas.
     esquema_detallado = """
-    CONTEXTO: Base de datos de un programa de emprendimiento en MENORCA.
-    
-    TABLAS:
-    - public.Person: id, full_name, email, contact_type, expertise_tags (jsonb), startup_id, arrival_date (llegada a menorca), departure_date (salida de menorca).
-      * Valores contact_type: 'experience_maker', 'team', 'vc', 'founder', 'staff'.
-    - public.Startup: id, name, sector, stage.
-    - public.Event: id, title, description, location, start_time, speaker_id.
-    - public.UserEvent: user_id, event_id (Relaciona personas con asistencia a eventos).
-
-    REGLAS DE SQL:
-    - IMPORTANTE: Usa SIEMPRE comillas dobles para los nombres de las tablas.
-        Ejemplo: public."Person", public."Startup", public."Event".
-    - Si no usas comillas dobles, la consulta fallará.
-    - "Experience Makers" -> contact_type = 'experience_maker'.
-    - Ubicación -> Si mencionan lugares de Menorca, buscar en public.Event.location.
-    - "Hoy" -> Usar CURRENT_DATE.
-    - Para saber si alguien esté en el programa o en menorca comparar hoy con arrival_date y departure_date.
-    - Para filtrar por expertise_tags (JSONB), usar: expertise_tags ? 'Valor'.
-    - Usar siempre ILIKE para textos y LIMIT 20.
-    - Responder SOLO con el código SQL puro.
+    Convierte lenguaje natural a SQL Postgres para MENORCA.
+    Tablas:
+    - public."Person"(id, full_name, email, contact_type, expertise_tags, startup_id, arrival_date, departure_date)
+    - public."Startup"(id, name, sector, stage)
+    - public."Event"(id, title, description, location, start_time, speaker_id)
+    - public."UserEvent"(user_id, event_id)
+    Joins:
+    - Person.startup_id = Startup.id
+    - UserEvent.user_id = Person.id
+    - UserEvent.event_id = Event.id
+    - Event.speaker_id = Person.id
+    Reglas:
+    - Usa SIEMPRE tablas con comillas dobles.
+    - "Experience Makers" => contact_type = 'experience_maker'
+    - "hoy" => CURRENT_DATE
+    - En Menorca hoy => arrival_date <= CURRENT_DATE AND (departure_date IS NULL OR departure_date >= CURRENT_DATE)
+    - Para textos usa ILIKE; para expertise_tags usa operador ?.
+    - Devuelve una sola consulta SELECT (o WITH...SELECT), sin markdown ni comentarios, LIMIT 20.
     """
 
     try:
         # PASO A: Generar el SQL
         res_sql = claude.messages.create(
             model=model_claude,
-            max_tokens=300,
+            max_tokens=180,
             system=esquema_detallado,
             messages=[{"role": "user", "content": f"Genera el SQL para: {pregunta}"}]
         )
@@ -150,19 +148,16 @@ def flujo_pregunta_respuesta(pregunta):
                 datos_crudos = []
 
         # PASO C: Traducir a respuesta humana
-        prompt_humano = f"""
-        El usuario preguntó: "{pregunta}"
-        Los datos obtenidos de la base de datos son: {datos_crudos}
-        
-        Instrucciones:
-        - Si hay datos, redacta una respuesta amable y concisa.
-        - Si no hay datos, indica que no encontraste información sobre eso.
-        - Si los datos contienen un error, explica brevemente que hubo un problema técnico.
-        """
+        prompt_humano = (
+            f'Pregunta: "{pregunta}"\n'
+            f"Datos: {datos_crudos}\n"
+            "Responde en espanol, breve y clara. Si no hay datos, dilo. "
+            "Si hay error tecnico, explicalo en una frase."
+        )
 
         res_final = claude.messages.create(
             model=model_claude,
-            max_tokens=500,
+            max_tokens=180,
             messages=[{"role": "user", "content": prompt_humano}]
         )
         return res_final.content[0].text

@@ -230,6 +230,7 @@ def flujo_pregunta_respuesta(pregunta):
     Semantica:
     - "quien esta", "quienes estan", "en Menorca", "en el programa" => personas presentes por rango de fechas.
     - Presente en fecha X => arrival_date <= X AND (departure_date IS NULL OR departure_date >= X).
+    - "a que hora", "horario", "eventos a las 18:00" => consultas sobre public."Event".start_time.
     Reglas de fechas:
     - "hoy" => CURRENT_DATE.
     - "manana" => CURRENT_DATE + INTERVAL '1 day'.
@@ -241,6 +242,9 @@ def flujo_pregunta_respuesta(pregunta):
     - Usa SIEMPRE nombres con comillas dobles.
     - "Experience Makers" => contact_type = 'experience_maker'.
     - Para textos usa ILIKE; para expertise_tags usa operador ?.
+    - start_time es timestamptz. Para filtrar por dia local, usa (start_time AT TIME ZONE 'Europe/Madrid')::date.
+    - Para mostrar hora local, usa to_char(start_time AT TIME ZONE 'Europe/Madrid', 'HH24:MI') AS hora_local.
+    - Si preguntan "a las HH:MM", compara to_char(start_time AT TIME ZONE 'Europe/Madrid', 'HH24:MI') = 'HH:MM'.
     - Devuelve una sola consulta SELECT (o WITH...SELECT), sin markdown ni comentarios, LIMIT 20.
     Ejemplo:
     - Pregunta: "quien esta el dia 24"
@@ -321,6 +325,7 @@ def flujo_pregunta_respuesta(pregunta):
         prompt_humano = (
             f'Pregunta: "{pregunta}"\n'
             f"Datos: {datos_crudos}\n"
+            "Si aparecen fechas/horas de eventos, expresalas en horario de Menorca (Europe/Madrid). "
             "Responde en espanol, breve y clara. Si no hay datos, dilo. "
             "Si hay error tecnico, explicalo en una frase."
         )

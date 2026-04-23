@@ -318,6 +318,12 @@ def flujo_pregunta_respuesta(pregunta):
     - Nunca uses SELECT *. Selecciona solo columnas necesarias para responder.
     - Si el usuario no pide campos concretos, devuelve el minimo util (ejemplo en personas: full_name).
     - Para textos usa ILIKE; para expertise_tags usa operador ?.
+    - En busquedas por nombres/texto libre (personas, startups, eventos, ubicacion), haz comparacion sin mayusculas y sin tildes:
+      unaccent(lower(columna)) ILIKE unaccent(lower('%valor%')).
+    - Si comparas igualdad por nombre, tambien sin tildes/mayusculas:
+      unaccent(lower(columna)) = unaccent(lower('valor')).
+    - Aplica esto especialmente a: full_name, name, title, location, sector.
+    - Si no se puede usar unaccent, usa fallback con lower(columna) ILIKE lower('%valor%').
     - start_time es timestamptz. Para filtrar por dia local, usa (start_time AT TIME ZONE 'Europe/Madrid')::date.
     - Para mostrar hora local, usa to_char(start_time AT TIME ZONE 'Europe/Madrid', 'HH24:MI') AS hora_local.
     - Si preguntan "a las HH:MM", compara to_char(start_time AT TIME ZONE 'Europe/Madrid', 'HH24:MI') = 'HH:MM'.

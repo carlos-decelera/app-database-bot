@@ -86,6 +86,13 @@ def _asegurar_limit(sql_query, limit_default=20):
     return f"{cleaned} LIMIT {limit_default}"
 
 
+def _limit_por_intencion(pregunta):
+    texto = (pregunta or "").lower()
+    if any(token in texto for token in ["todos", "todas", "lista completa", "completo"]):
+        return 200
+    return 50
+
+
 def _es_sql_segura_para_lectura(sql_query):
     cleaned = _normalizar_sql_generada(sql_query)
     if not cleaned:
@@ -252,6 +259,7 @@ def flujo_pregunta_respuesta(pregunta):
     """
 
     try:
+        limit_objetivo = _limit_por_intencion(pregunta)
         fecha_explicita_iso = _resolver_fecha_explicita(pregunta)
         contexto_fecha = (
             f"\nFecha detectada en la pregunta (usar literalmente): {fecha_explicita_iso}."
@@ -266,7 +274,7 @@ def flujo_pregunta_respuesta(pregunta):
             system=esquema_detallado,
             messages=[{"role": "user", "content": f"Genera el SQL para: {pregunta}.{contexto_fecha}"}]
         )
-        sql_query = _asegurar_limit(res_sql.content[0].text, limit_default=20)
+        sql_query = _asegurar_limit(res_sql.content[0].text, limit_default=limit_objetivo)
         
         # Log para debug en Railway
         print(f"--- SQL GENERADO ---\n{sql_query}\n")
@@ -306,11 +314,11 @@ def flujo_pregunta_respuesta(pregunta):
                     "content": (
                         f"Reformula la consulta SQL para: {pregunta}. "
                         f"Usa obligatoriamente la fecha literal DATE '{fecha_explicita_iso}'. "
-                        "Manten una sola sentencia SELECT y LIMIT 20."
+                        f"Manten una sola sentencia SELECT y LIMIT {limit_objetivo}."
                     )
                 }]
             )
-            sql_query_retry = _asegurar_limit(res_sql_retry.content[0].text, limit_default=20)
+            sql_query_retry = _asegurar_limit(res_sql_retry.content[0].text, limit_default=limit_objetivo)
             print(f"--- SQL RETRY ---\n{sql_query_retry}\n")
             if _es_sql_segura_para_lectura(sql_query_retry):
                 db_res_retry = supabase.rpc("exec_sql", {"query_text": sql_query_retry}).execute()
@@ -322,10 +330,14 @@ def flujo_pregunta_respuesta(pregunta):
                         datos_crudos = datos_retry
 
         # PASO C: Traducir a respuesta humana
+        total_filas = len(datos_crudos) if isinstance(datos_crudos, list) else None
         prompt_humano = (
             f'Pregunta: "{pregunta}"\n'
             f"Datos: {datos_crudos}\n"
+            f"Filas devueltas por la consulta: {total_filas}\n"
             "Si aparecen fechas/horas de eventos, expresalas en horario de Menorca (Europe/Madrid). "
+            "No digas 'todos' o 'lista completa' si no puedes garantizarlo; "
+            "di 'estos son los resultados encontrados' e indica el numero de filas cuando aplique. "
             "Responde en espanol, breve y clara. Si no hay datos, dilo. "
             "Si hay error tecnico, explicalo en una frase."
         )

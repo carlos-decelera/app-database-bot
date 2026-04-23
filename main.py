@@ -136,6 +136,43 @@ def _es_sql_segura_para_lectura(sql_query):
     return not any(re.search(pattern, lowered) for pattern in blocked_patterns)
 
 
+def _sql_fallback_sin_unaccent(sql_query):
+    cleaned = _normalizar_sql_generada(sql_query)
+    # Fallback simple y seguro:
+    # unaccent(lower(campo)) -> lower(campo)
+    # unaccent(lower('texto')) -> lower('texto')
+    # unaccent(campo) -> campo
+    fallback = re.sub(
+        r"unaccent\s*\(\s*lower\s*\((.*?)\)\s*\)",
+        r"lower(\1)",
+        cleaned,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    fallback = re.sub(
+        r"unaccent\s*\((.*?)\)",
+        r"\1",
+        fallback,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return fallback
+
+
+def _ejecutar_sql_con_fallback_unaccent(sql_query):
+    db_res = supabase.rpc("exec_sql", {"query_text": sql_query}).execute()
+    error_obj = getattr(db_res, "error", None)
+    if not error_obj:
+        return db_res
+
+    error_text = str(error_obj).lower()
+    if "unaccent" not in error_text:
+        return db_res
+
+    sql_fallback = _sql_fallback_sin_unaccent(sql_query)
+    print("--- SQL FALLBACK (SIN UNACCENT) ---")
+    print(sql_fallback)
+    return supabase.rpc("exec_sql", {"query_text": sql_fallback}).execute()
+
+
 def _extraer_texto_mencion(event):
     text = (event.get("text") or "").strip()
     if not text:
@@ -366,7 +403,7 @@ def flujo_pregunta_respuesta(pregunta):
             )
 
         # PASO B: Ejecutar en Supabase vía RPC
-        db_res = supabase.rpc("exec_sql", {"query_text": sql_query}).execute()
+        db_res = _ejecutar_sql_con_fallback_unaccent(sql_query)
         if getattr(db_res, "error", None):
             print(f"ERROR SUPABASE RPC: {db_res.error}")
             datos_crudos = {"error": str(db_res.error)}
@@ -400,7 +437,7 @@ def flujo_pregunta_respuesta(pregunta):
             sql_query_retry = _asegurar_limit(res_sql_retry.content[0].text, limit_default=limit_objetivo)
             print(f"--- SQL RETRY ---\n{sql_query_retry}\n")
             if _es_sql_segura_para_lectura(sql_query_retry):
-                db_res_retry = supabase.rpc("exec_sql", {"query_text": sql_query_retry}).execute()
+                db_res_retry = _ejecutar_sql_con_fallback_unaccent(sql_query_retry)
                 if getattr(db_res_retry, "error", None):
                     print(f"ERROR SUPABASE RPC RETRY: {db_res_retry.error}")
                 else:
@@ -413,7 +450,7 @@ def flujo_pregunta_respuesta(pregunta):
             try:
                 sql_count = _sql_para_count_total(sql_query)
                 print(f"--- SQL COUNT ---\n{sql_count}\n")
-                db_res_count = supabase.rpc("exec_sql", {"query_text": sql_count}).execute()
+                db_res_count = _ejecutar_sql_con_fallback_unaccent(sql_count)
                 if not getattr(db_res_count, "error", None):
                     count_data = getattr(db_res_count, "data", None)
                     if isinstance(count_data, list) and count_data:

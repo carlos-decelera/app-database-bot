@@ -97,7 +97,7 @@ def flujo_pregunta_respuesta(pregunta):
     
     # Prompt compacto para reducir coste, manteniendo reglas críticas.
     esquema_detallado = """
-    Convierte lenguaje natural a SQL Postgres para MENORCA.
+    Convierte lenguaje natural a SQL Postgres para esta base de datos de un programa en Menorca.
     Tablas:
     - public."Person"(id, full_name, email, contact_type, expertise_tags, startup_id, arrival_date, departure_date)
     - public."Startup"(id, name, sector, stage)

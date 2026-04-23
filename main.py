@@ -93,6 +93,24 @@ def _limit_por_intencion(pregunta):
     return 50
 
 
+def _quiere_total_completo(pregunta):
+    texto = (pregunta or "").lower()
+    return any(token in texto for token in ["todos", "todas", "lista completa", "completo", "cuantos", "cuántos", "total"])
+
+
+def _sql_para_count_total(sql_query):
+    cleaned = _normalizar_sql_generada(sql_query)
+    # Quita LIMIT/OFFSET al final para obtener el total real.
+    base = re.sub(
+        r"\s+limit\s+\d+(\s+offset\s+\d+)?\s*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    base = re.sub(r"\s+offset\s+\d+\s*$", "", base, flags=re.IGNORECASE)
+    return f'SELECT COUNT(*) AS total FROM ({base}) AS "__subq__"'
+
+
 def _es_sql_segura_para_lectura(sql_query):
     cleaned = _normalizar_sql_generada(sql_query)
     if not cleaned:
@@ -329,15 +347,30 @@ def flujo_pregunta_respuesta(pregunta):
                     if isinstance(datos_retry, list):
                         datos_crudos = datos_retry
 
+        total_global = None
+        if _quiere_total_completo(pregunta) and _es_sql_segura_para_lectura(sql_query):
+            try:
+                sql_count = _sql_para_count_total(sql_query)
+                print(f"--- SQL COUNT ---\n{sql_count}\n")
+                db_res_count = supabase.rpc("exec_sql", {"query_text": sql_count}).execute()
+                if not getattr(db_res_count, "error", None):
+                    count_data = getattr(db_res_count, "data", None)
+                    if isinstance(count_data, list) and count_data:
+                        total_global = count_data[0].get("total")
+            except Exception as count_error:
+                print(f"ERROR COUNT TOTAL: {count_error}")
+
         # PASO C: Traducir a respuesta humana
         total_filas = len(datos_crudos) if isinstance(datos_crudos, list) else None
         prompt_humano = (
             f'Pregunta: "{pregunta}"\n'
             f"Datos: {datos_crudos}\n"
             f"Filas devueltas por la consulta: {total_filas}\n"
+            f"Total global estimado (sin LIMIT): {total_global}\n"
             "Si aparecen fechas/horas de eventos, expresalas en horario de Menorca (Europe/Madrid). "
             "No digas 'todos' o 'lista completa' si no puedes garantizarlo; "
-            "di 'estos son los resultados encontrados' e indica el numero de filas cuando aplique. "
+            "si hay total global, di claramente 'te muestro X de Y'. "
+            "Si no hay total global, di 'estos son los resultados encontrados' e indica el numero de filas cuando aplique. "
             "Responde en espanol, breve y clara. Si no hay datos, dilo. "
             "Si hay error tecnico, explicalo en una frase."
         )

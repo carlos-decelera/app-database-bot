@@ -97,7 +97,7 @@ def flujo_pregunta_respuesta(pregunta):
     
     # Prompt compacto para reducir coste, manteniendo reglas críticas.
     esquema_detallado = """
-    Convierte lenguaje natural a SQL Postgres para esta base de datos de un programa en Menorca.
+    Convierte lenguaje natural en SQL Postgres para un programa en Menorca.
     Tablas:
     - public."Person"(id, full_name, email, contact_type, expertise_tags, startup_id, arrival_date, departure_date)
     - public."Startup"(id, name, sector, stage)
@@ -108,13 +108,24 @@ def flujo_pregunta_respuesta(pregunta):
     - UserEvent.user_id = Person.id
     - UserEvent.event_id = Event.id
     - Event.speaker_id = Person.id
-    Reglas:
-    - Usa SIEMPRE tablas con comillas dobles.
-    - "Experience Makers" => contact_type = 'experience_maker'
-    - "hoy" => CURRENT_DATE
-    - En Menorca hoy => arrival_date <= CURRENT_DATE AND (departure_date IS NULL OR departure_date >= CURRENT_DATE)
+    Semantica:
+    - "quien esta", "quienes estan", "en Menorca", "en el programa" => personas presentes por rango de fechas.
+    - Presente en fecha X => arrival_date <= X AND (departure_date IS NULL OR departure_date >= X).
+    Reglas de fechas:
+    - "hoy" => CURRENT_DATE.
+    - "manana" => CURRENT_DATE + INTERVAL '1 day'.
+    - "ayer" => CURRENT_DATE - INTERVAL '1 day'.
+    - "dia 24" sin mes/anio => dia 24 del mes actual:
+      (date_trunc('month', CURRENT_DATE)::date + INTERVAL '23 day')::date
+    - Si hay mes explicito (ej: "24 de mayo"), usa esa fecha del anio actual.
+    Reglas SQL:
+    - Usa SIEMPRE nombres con comillas dobles.
+    - "Experience Makers" => contact_type = 'experience_maker'.
     - Para textos usa ILIKE; para expertise_tags usa operador ?.
     - Devuelve una sola consulta SELECT (o WITH...SELECT), sin markdown ni comentarios, LIMIT 20.
+    Ejemplo:
+    - Pregunta: "quien esta el dia 24"
+    - SQL: SELECT full_name FROM public."Person" WHERE arrival_date <= (date_trunc('month', CURRENT_DATE)::date + INTERVAL '23 day')::date AND (departure_date IS NULL OR departure_date >= (date_trunc('month', CURRENT_DATE)::date + INTERVAL '23 day')::date) LIMIT 20
     """
 
     try:

@@ -426,6 +426,8 @@ def flujo_pregunta_respuesta(pregunta):
             "No digas 'todos' o 'lista completa' si no puedes garantizarlo; "
             "si hay total global, di claramente 'te muestro X de Y'. "
             "Si no hay total global, di 'estos son los resultados encontrados' e indica el numero de filas cuando aplique. "
+            "No ofrezcas acciones que no puedes ejecutar (ej: 'puedo intentar ampliar la busqueda'). "
+            "No uses frases condicionales de capacidad futura; responde solo con resultado actual y limites actuales. "
             "Responde en espanol, breve y clara. Si no hay datos, dilo. "
             "Si hay error tecnico, explicalo en una frase."
         )

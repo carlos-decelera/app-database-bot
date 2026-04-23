@@ -192,6 +192,52 @@ def _resolver_fecha_explicita(pregunta):
     return None
 
 
+def _hint_campos_solicitados(pregunta):
+    texto = (pregunta or "").lower()
+    pide_extras = any(
+        token in texto
+        for token in [
+            "email",
+            "mail",
+            "especialidad",
+            "especialidades",
+            "expertise",
+            "sector",
+            "startup",
+            "llegada",
+            "salida",
+            "fecha",
+            "telefono",
+            "contacto",
+        ]
+    )
+    if ("experience maker" in texto or "experience makers" in texto) and not pide_extras:
+        return (
+            "Si piden lista de Experience Makers sin campos adicionales, "
+            "selecciona solo full_name (no email ni expertise_tags)."
+        )
+    return ""
+
+
+def _dividir_texto_slack(texto, max_chars=3200):
+    if not texto:
+        return [""]
+    if len(texto) <= max_chars:
+        return [texto]
+
+    partes = []
+    restante = texto
+    while len(restante) > max_chars:
+        corte = restante.rfind("\n", 0, max_chars)
+        if corte < 0:
+            corte = max_chars
+        partes.append(restante[:corte].strip())
+        restante = restante[corte:].strip()
+    if restante:
+        partes.append(restante)
+    return partes
+
+
 def _procesar_evento_pregunta(event, say, limpiar_menciones=False):
     texto = (event.get("text") or "").strip()
     if limpiar_menciones:
@@ -230,8 +276,11 @@ def _procesar_evento_pregunta(event, say, limpiar_menciones=False):
             except Exception as reaction_error:
                 print(f"No se pudo quitar reacción de progreso: {reaction_error}")
 
-    # Respondemos en la conversación principal (sin hilo).
-    say(text=respuesta)
+    # Respondemos en la conversación principal (sin hilo), fragmentando si es largo.
+    partes = _dividir_texto_slack(respuesta, max_chars=3200)
+    for idx, parte in enumerate(partes):
+        prefijo = f"(Parte {idx + 1}/{len(partes)})\n" if len(partes) > 1 else ""
+        say(text=f"{prefijo}{parte}")
 
 
 def flujo_pregunta_respuesta(pregunta):
@@ -266,6 +315,8 @@ def flujo_pregunta_respuesta(pregunta):
     Reglas SQL:
     - Usa SIEMPRE nombres con comillas dobles.
     - "Experience Makers" => contact_type = 'experience_maker'.
+    - Nunca uses SELECT *. Selecciona solo columnas necesarias para responder.
+    - Si el usuario no pide campos concretos, devuelve el minimo util (ejemplo en personas: full_name).
     - Para textos usa ILIKE; para expertise_tags usa operador ?.
     - start_time es timestamptz. Para filtrar por dia local, usa (start_time AT TIME ZONE 'Europe/Madrid')::date.
     - Para mostrar hora local, usa to_char(start_time AT TIME ZONE 'Europe/Madrid', 'HH24:MI') AS hora_local.
@@ -284,13 +335,17 @@ def flujo_pregunta_respuesta(pregunta):
             if fecha_explicita_iso
             else ""
         )
+        contexto_campos = _hint_campos_solicitados(pregunta)
 
         # PASO A: Generar el SQL
         res_sql = claude.messages.create(
             model=model_claude,
             max_tokens=180,
             system=esquema_detallado,
-            messages=[{"role": "user", "content": f"Genera el SQL para: {pregunta}.{contexto_fecha}"}]
+            messages=[{
+                "role": "user",
+                "content": f"Genera el SQL para: {pregunta}.{contexto_fecha}\n{contexto_campos}",
+            }]
         )
         sql_query = _asegurar_limit(res_sql.content[0].text, limit_default=limit_objetivo)
         
@@ -377,7 +432,7 @@ def flujo_pregunta_respuesta(pregunta):
 
         res_final = claude.messages.create(
             model=model_claude,
-            max_tokens=180,
+            max_tokens=320,
             messages=[{"role": "user", "content": prompt_humano}]
         )
         return res_final.content[0].text

@@ -90,6 +90,49 @@ def _extraer_texto_mencion(event):
     text = re.sub(r"<@[A-Z0-9]+>", "", text).strip()
     return text
 
+
+def _procesar_evento_pregunta(event, say, limpiar_menciones=False):
+    texto = (event.get("text") or "").strip()
+    if limpiar_menciones:
+        texto = _extraer_texto_mencion(event)
+
+    event_ts = event.get("ts")
+    channel_id = event.get("channel")
+
+    if not texto:
+        say("Escríbeme una pregunta para poder ayudarte.")
+        return
+
+    # Indicador visual sin mensaje: reacción sobre el mensaje del usuario.
+    reaction_added = False
+    if channel_id and event_ts:
+        try:
+            app.client.reactions_add(
+                channel=channel_id,
+                timestamp=event_ts,
+                name="mag",
+            )
+            reaction_added = True
+        except Exception as reaction_error:
+            print(f"No se pudo agregar reacción de progreso: {reaction_error}")
+
+    try:
+        respuesta = flujo_pregunta_respuesta(texto)
+    finally:
+        if reaction_added and channel_id and event_ts:
+            try:
+                app.client.reactions_remove(
+                    channel=channel_id,
+                    timestamp=event_ts,
+                    name="mag",
+                )
+            except Exception as reaction_error:
+                print(f"No se pudo quitar reacción de progreso: {reaction_error}")
+
+    # Respondemos en la conversación principal (sin hilo).
+    say(text=respuesta)
+
+
 def flujo_pregunta_respuesta(pregunta):
     """
     Proceso: Lenguaje Natural -> SQL -> Supabase -> Respuesta Humana
@@ -181,43 +224,18 @@ def flujo_pregunta_respuesta(pregunta):
 
 @app.event("app_mention")
 def handle_mentions(event, say):
-    # Obtenemos la pregunta (quitando la mención al bot)
-    texto = _extraer_texto_mencion(event)
-    event_ts = event.get("ts")
-    channel_id = event.get("channel")
+    _procesar_evento_pregunta(event, say, limpiar_menciones=True)
 
-    if not texto:
-        say("Escríbeme una pregunta después de mencionarme para poder ayudarte.")
+
+@app.event("message")
+def handle_private_messages(event, say):
+    # Solo procesa DMs del usuario para evitar ruido y loops.
+    if event.get("channel_type") != "im":
+        return
+    if event.get("bot_id") or event.get("subtype"):
         return
 
-    # Indicador visual sin mensaje: reacción sobre el mensaje del usuario.
-    reaction_added = False
-    if channel_id and event_ts:
-        try:
-            app.client.reactions_add(
-                channel=channel_id,
-                timestamp=event_ts,
-                name="mag",
-            )
-            reaction_added = True
-        except Exception as reaction_error:
-            print(f"No se pudo agregar reacción de progreso: {reaction_error}")
-
-    try:
-        respuesta = flujo_pregunta_respuesta(texto)
-    finally:
-        if reaction_added and channel_id and event_ts:
-            try:
-                app.client.reactions_remove(
-                    channel=channel_id,
-                    timestamp=event_ts,
-                    name="mag",
-                )
-            except Exception as reaction_error:
-                print(f"No se pudo quitar reacción de progreso: {reaction_error}")
-
-    # Respondemos en la conversación principal (sin hilo).
-    say(text=respuesta)
+    _procesar_evento_pregunta(event, say, limpiar_menciones=False)
 
 # --- RUTAS PARA RAILWAY ---
 

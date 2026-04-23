@@ -446,7 +446,17 @@ def flujo_pregunta_respuesta(pregunta):
                         datos_crudos = datos_retry
 
         total_global = None
-        if _quiere_total_completo(pregunta) and _es_sql_segura_para_lectura(sql_query):
+        # Calcula total real cuando puede haber truncado por LIMIT,
+        # o cuando la pregunta requiere totales/listados completos.
+        necesita_total_global = (
+            isinstance(datos_crudos, list)
+            and _es_sql_segura_para_lectura(sql_query)
+            and (
+                _quiere_total_completo(pregunta)
+                or len(datos_crudos) >= limit_objetivo
+            )
+        )
+        if necesita_total_global:
             try:
                 sql_count = _sql_para_count_total(sql_query)
                 print(f"--- SQL COUNT ---\n{sql_count}\n")
@@ -463,12 +473,13 @@ def flujo_pregunta_respuesta(pregunta):
         prompt_humano = (
             f'Pregunta: "{pregunta}"\n'
             f"Datos: {datos_crudos}\n"
-            f"Filas devueltas por la consulta: {total_filas}\n"
-            f"Total global estimado (sin LIMIT): {total_global}\n"
+            f"Filas mostradas en esta respuesta (X): {total_filas}\n"
+            f"Total real sin LIMIT (Y): {total_global}\n"
             "Si aparecen fechas/horas de eventos, expresalas en horario de Menorca (Europe/Madrid). "
             "No digas 'todos' o 'lista completa' si no puedes garantizarlo; "
             "si hay total global, di claramente 'te muestro X de Y'. "
-            "Si no hay total global, di 'estos son los resultados encontrados' e indica el numero de filas cuando aplique. "
+            "Si no hay total global, di 'te muestro X resultados en esta respuesta'. "
+            "Nunca digas 'de un total de N filas consultadas'. "
             "No ofrezcas acciones que no puedes ejecutar (ej: 'puedo intentar ampliar la busqueda'). "
             "No uses frases condicionales de capacidad futura; responde solo con resultado actual y limites actuales. "
             "Responde en espanol, breve y clara. Si no hay datos, dilo. "

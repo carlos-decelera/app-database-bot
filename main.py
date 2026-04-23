@@ -1,5 +1,6 @@
 import os
 import re
+from datetime import date
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
@@ -39,6 +40,22 @@ handler = SlackRequestHandler(app)
 
 # --- LÓGICA DEL BOT ---
 
+MESES_ES = {
+    "enero": 1,
+    "febrero": 2,
+    "marzo": 3,
+    "abril": 4,
+    "mayo": 5,
+    "junio": 6,
+    "julio": 7,
+    "agosto": 8,
+    "septiembre": 9,
+    "setiembre": 9,
+    "octubre": 10,
+    "noviembre": 11,
+    "diciembre": 12,
+}
+
 
 def _normalizar_sql_generada(sql_query):
     cleaned = (sql_query or "").strip()
@@ -55,6 +72,18 @@ def _normalizar_sql_generada(sql_query):
         cleaned = cleaned[:-1].strip()
 
     return cleaned
+
+
+def _asegurar_limit(sql_query, limit_default=20):
+    cleaned = _normalizar_sql_generada(sql_query)
+    if not cleaned:
+        return cleaned
+
+    # Si ya tiene LIMIT, no tocar.
+    if re.search(r"\blimit\s+\d+\b", cleaned, flags=re.IGNORECASE):
+        return cleaned
+
+    return f"{cleaned} LIMIT {limit_default}"
 
 
 def _es_sql_segura_para_lectura(sql_query):
@@ -89,6 +118,53 @@ def _extraer_texto_mencion(event):
     # Elimina menciones tipo <@U123ABC>.
     text = re.sub(r"<@[A-Z0-9]+>", "", text).strip()
     return text
+
+
+def _resolver_fecha_explicita(pregunta):
+    texto = (pregunta or "").lower()
+
+    # 1) Captura: "25 de mayo" o "25 mayo".
+    match_mes = re.search(
+        r"\b(\d{1,2})\s*(?:de\s+)?(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)\b",
+        texto,
+    )
+    if match_mes:
+        day = int(match_mes.group(1))
+        month = MESES_ES[match_mes.group(2)]
+        year = date.today().year
+        try:
+            return date(year, month, day).isoformat()
+        except ValueError:
+            return None
+
+    # 2) Captura: "25/05", "25-05", "25.05" con año opcional.
+    match_num = re.search(r"\b(\d{1,2})[\/\-.](\d{1,2})(?:[\/\-.](\d{2,4}))?\b", texto)
+    if match_num:
+        day = int(match_num.group(1))
+        month = int(match_num.group(2))
+        year_txt = match_num.group(3)
+        if year_txt:
+            year = int(year_txt)
+            if year < 100:
+                year += 2000
+        else:
+            year = date.today().year
+        try:
+            return date(year, month, day).isoformat()
+        except ValueError:
+            return None
+
+    # 3) Captura: "dia 25" o "día 25" sin mes -> asume mes actual.
+    match_dia = re.search(r"\bd[ií]a\s+(\d{1,2})\b", texto)
+    if match_dia:
+        day = int(match_dia.group(1))
+        today = date.today()
+        try:
+            return date(today.year, today.month, day).isoformat()
+        except ValueError:
+            return None
+
+    return None
 
 
 def _procesar_evento_pregunta(event, say, limpiar_menciones=False):
@@ -172,14 +248,21 @@ def flujo_pregunta_respuesta(pregunta):
     """
 
     try:
+        fecha_explicita_iso = _resolver_fecha_explicita(pregunta)
+        contexto_fecha = (
+            f"\nFecha detectada en la pregunta (usar literalmente): {fecha_explicita_iso}."
+            if fecha_explicita_iso
+            else ""
+        )
+
         # PASO A: Generar el SQL
         res_sql = claude.messages.create(
             model=model_claude,
             max_tokens=180,
             system=esquema_detallado,
-            messages=[{"role": "user", "content": f"Genera el SQL para: {pregunta}"}]
+            messages=[{"role": "user", "content": f"Genera el SQL para: {pregunta}.{contexto_fecha}"}]
         )
-        sql_query = _normalizar_sql_generada(res_sql.content[0].text)
+        sql_query = _asegurar_limit(res_sql.content[0].text, limit_default=20)
         
         # Log para debug en Railway
         print(f"--- SQL GENERADO ---\n{sql_query}\n")
@@ -200,6 +283,39 @@ def flujo_pregunta_respuesta(pregunta):
             datos_crudos = getattr(db_res, "data", None)
             if datos_crudos is None:
                 datos_crudos = []
+
+        # Fallback barato: si hay fecha clara y no hay resultados,
+        # pide una segunda SQL más literal con esa fecha.
+        if (
+            not getattr(db_res, "error", None)
+            and isinstance(datos_crudos, list)
+            and len(datos_crudos) == 0
+            and fecha_explicita_iso
+        ):
+            print("Reintentando SQL por resultado vacio con fecha explicita...")
+            res_sql_retry = claude.messages.create(
+                model=model_claude,
+                max_tokens=120,
+                system=esquema_detallado,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Reformula la consulta SQL para: {pregunta}. "
+                        f"Usa obligatoriamente la fecha literal DATE '{fecha_explicita_iso}'. "
+                        "Manten una sola sentencia SELECT y LIMIT 20."
+                    )
+                }]
+            )
+            sql_query_retry = _asegurar_limit(res_sql_retry.content[0].text, limit_default=20)
+            print(f"--- SQL RETRY ---\n{sql_query_retry}\n")
+            if _es_sql_segura_para_lectura(sql_query_retry):
+                db_res_retry = supabase.rpc("exec_sql", {"query_text": sql_query_retry}).execute()
+                if getattr(db_res_retry, "error", None):
+                    print(f"ERROR SUPABASE RPC RETRY: {db_res_retry.error}")
+                else:
+                    datos_retry = getattr(db_res_retry, "data", None)
+                    if isinstance(datos_retry, list):
+                        datos_crudos = datos_retry
 
         # PASO C: Traducir a respuesta humana
         prompt_humano = (

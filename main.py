@@ -29,6 +29,7 @@ if missing_env_vars:
 claude = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 model_claude = os.getenv("CLAUDE_MODEL")
+USE_CLAUDE_FOR_FINAL_TEXT = os.getenv("USE_CLAUDE_FOR_FINAL_TEXT", "false").lower() == "true"
 
 # Configuración de Slack
 app = App(
@@ -275,6 +276,41 @@ def _dividir_texto_slack(texto, max_chars=3200):
     return partes
 
 
+def _extraer_texto_claude(response):
+    contenido = getattr(response, "content", None) or []
+    if not contenido:
+        return ""
+    primer_bloque = contenido[0]
+    return (getattr(primer_bloque, "text", "") or "").strip()
+
+
+def _respuesta_deterministica(datos_crudos, total_filas, total_global, limit_objetivo):
+    if isinstance(datos_crudos, dict) and datos_crudos.get("error"):
+        return f"Ha ocurrido un error tecnico consultando la base de datos: {datos_crudos.get('error')}"
+
+    if not isinstance(datos_crudos, list):
+        return "No pude interpretar correctamente el resultado de la consulta."
+
+    if len(datos_crudos) == 0:
+        return "No encontré resultados para esa consulta."
+
+    if total_global is not None:
+        cabecera = f"Te muestro {total_filas} de {total_global} resultados."
+    else:
+        cabecera = f"Te muestro {total_filas} resultados en esta respuesta (limite {limit_objetivo})."
+
+    lineas = [cabecera, ""]
+    max_columnas = 6
+    for idx, fila in enumerate(datos_crudos, start=1):
+        if isinstance(fila, dict):
+            columnas = list(fila.keys())[:max_columnas]
+            pares = [f"{col}: {fila.get(col)}" for col in columnas]
+            lineas.append(f"{idx}. " + " | ".join(pares))
+        else:
+            lineas.append(f"{idx}. {fila}")
+    return "\n".join(lineas)
+
+
 def _procesar_evento_pregunta(event, say, limpiar_menciones=False):
     texto = (event.get("text") or "").strip()
     if limpiar_menciones:
@@ -331,13 +367,13 @@ def flujo_pregunta_respuesta(pregunta):
     Tablas:
     - public."Person"(id, full_name, email, contact_type, expertise_tags, startup_id, arrival_date, departure_date)
     - public."Startup"(id, name, sector, stage)
-    - public."Event"(id, title, description, location, start_time, speaker_id)
+    - public."Event"(id, title, description, location, start_time)
     - public."UserEvent"(user_id, event_id)
     Joins:
     - Person.startup_id = Startup.id
     - UserEvent.user_id = Person.id
     - UserEvent.event_id = Event.id
-    - Event.speaker_id = Person.id
+    - Para relacion evento-persona usa SIEMPRE UserEvent + Person.
     Semantica:
     - "quien esta", "quienes estan", "en Menorca", "en el programa" => personas presentes por rango de fechas.
     - Presente en fecha X => arrival_date <= X AND (departure_date IS NULL OR departure_date >= X).
@@ -390,7 +426,7 @@ def flujo_pregunta_respuesta(pregunta):
                 "content": f"Genera el SQL para: {pregunta}.{contexto_fecha}\n{contexto_campos}",
             }]
         )
-        sql_query = _asegurar_limit(res_sql.content[0].text, limit_default=limit_objetivo)
+        sql_query = _asegurar_limit(_extraer_texto_claude(res_sql), limit_default=limit_objetivo)
         
         # Log para debug en Railway
         print(f"--- SQL GENERADO ---\n{sql_query}\n")
@@ -434,7 +470,7 @@ def flujo_pregunta_respuesta(pregunta):
                     )
                 }]
             )
-            sql_query_retry = _asegurar_limit(res_sql_retry.content[0].text, limit_default=limit_objetivo)
+            sql_query_retry = _asegurar_limit(_extraer_texto_claude(res_sql_retry), limit_default=limit_objetivo)
             print(f"--- SQL RETRY ---\n{sql_query_retry}\n")
             if _es_sql_segura_para_lectura(sql_query_retry):
                 db_res_retry = _ejecutar_sql_con_fallback_unaccent(sql_query_retry)
@@ -468,30 +504,29 @@ def flujo_pregunta_respuesta(pregunta):
             except Exception as count_error:
                 print(f"ERROR COUNT TOTAL: {count_error}")
 
-        # PASO C: Traducir a respuesta humana
+        # PASO C: Respuesta final (determinista por robustez/coste).
         total_filas = len(datos_crudos) if isinstance(datos_crudos, list) else None
-        prompt_humano = (
-            f'Pregunta: "{pregunta}"\n'
-            f"Datos: {datos_crudos}\n"
-            f"Filas mostradas en esta respuesta (X): {total_filas}\n"
-            f"Total real sin LIMIT (Y): {total_global}\n"
-            "Si aparecen fechas/horas de eventos, expresalas en horario de Menorca (Europe/Madrid). "
-            "No digas 'todos' o 'lista completa' si no puedes garantizarlo; "
-            "si hay total global, di claramente 'te muestro X de Y'. "
-            "Si no hay total global, di 'te muestro X resultados en esta respuesta'. "
-            "Nunca digas 'de un total de N filas consultadas'. "
-            "No ofrezcas acciones que no puedes ejecutar (ej: 'puedo intentar ampliar la busqueda'). "
-            "No uses frases condicionales de capacidad futura; responde solo con resultado actual y limites actuales. "
-            "Responde en espanol, breve y clara. Si no hay datos, dilo. "
-            "Si hay error tecnico, explicalo en una frase."
+        respuesta_base = _respuesta_deterministica(
+            datos_crudos=datos_crudos,
+            total_filas=total_filas,
+            total_global=total_global,
+            limit_objetivo=limit_objetivo,
         )
 
+        if not USE_CLAUDE_FOR_FINAL_TEXT:
+            return respuesta_base
+
+        prompt_humano = (
+            f'Pregunta: "{pregunta}"\n'
+            f"Respuesta base (no inventar datos): {respuesta_base}\n"
+            "Reescribe en espanol, breve y clara, sin cambiar numeros."
+        )
         res_final = claude.messages.create(
             model=model_claude,
-            max_tokens=320,
+            max_tokens=180,
             messages=[{"role": "user", "content": prompt_humano}]
         )
-        return res_final.content[0].text
+        return _extraer_texto_claude(res_final) or respuesta_base
 
     except Exception as e:
         print(f"ERROR EN EL FLUJO: {e}")

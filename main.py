@@ -1,559 +1,537 @@
+"""
+Bot de Slack para Decelera — Claude + Supabase
+Convierte preguntas en lenguaje natural a SQL y devuelve resultados en Slack.
+"""
+
+import json
+import logging
 import os
 import re
 from datetime import date
+
+from anthropic import Anthropic
 from dotenv import load_dotenv
+from flask import Flask, request
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
-from flask import Flask, request
-from anthropic import Anthropic
 from supabase import create_client
 
 load_dotenv()
 
-# Validación temprana de variables críticas para evitar fallos opacos en runtime.
+logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Variables de entorno
+# ---------------------------------------------------------------------------
+
 REQUIRED_ENV_VARS = [
     "ANTHROPIC_API_KEY",
     "SUPABASE_URL",
     "SUPABASE_KEY",
-    "CLAUDE_MODEL",
     "SLACK_BOT_TOKEN",
     "SLACK_SIGNING_SECRET",
 ]
-missing_env_vars = [name for name in REQUIRED_ENV_VARS if not os.getenv(name)]
-if missing_env_vars:
-    raise RuntimeError(
-        "Faltan variables de entorno requeridas: " + ", ".join(missing_env_vars)
-    )
+missing = [v for v in REQUIRED_ENV_VARS if not os.getenv(v)]
+if missing:
+    raise RuntimeError(f"Faltan variables de entorno: {', '.join(missing)}")
 
-# Inicialización de clientes
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+TIMEZONE = os.getenv("TIMEZONE", "Europe/Madrid")
+
+# ---------------------------------------------------------------------------
+# Clientes
+# ---------------------------------------------------------------------------
+
 claude = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
-model_claude = os.getenv("CLAUDE_MODEL")
-USE_CLAUDE_FOR_FINAL_TEXT = os.getenv("USE_CLAUDE_FOR_FINAL_TEXT", "false").lower() == "true"
 
-# Configuración de Slack
-app = App(
-    token=os.getenv("SLACK_BOT_TOKEN"),
-    signing_secret=os.getenv("SLACK_SIGNING_SECRET")
-)
+app = App(token=os.getenv("SLACK_BOT_TOKEN"), signing_secret=os.getenv("SLACK_SIGNING_SECRET"))
 flask_app = Flask(__name__)
 handler = SlackRequestHandler(app)
 
-# --- LÓGICA DEL BOT ---
+# ---------------------------------------------------------------------------
+# Esquema de base de datos (system prompt para generación de SQL)
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT_SQL = f"""
+Eres un experto en SQL Postgres. Conviertes preguntas en lenguaje natural en consultas SQL
+para la base de datos de Decelera, un programa residencial de startups en Menorca.
+La zona horaria del programa es {TIMEZONE}.
+
+=== TABLAS (schema public, usar siempre comillas dobles) ===
+
+"Person" — personas del programa
+  id (uuid), full_name (text), email (text), bio (text),
+  photo_url, linkedin_url, company_name,
+  expertise_tags (jsonb, array de strings),
+  startup_id (uuid → "Startup".id),
+  user_id (uuid → auth),
+  arrival_date (timestamptz), departure_date (timestamptz),
+  contact_type (text): 'experience_maker' | 'team' | NULL (founders)
+  schedule_feedback (jsonb), daily_checkin (jsonb),
+  createdat, updatedat
+
+"Startup" — startups participantes
+  id (uuid), name (text), tagline, sector, stage,
+  logo_url, website_url, createdat, updatedat
+
+"Event" — eventos del programa
+  id (uuid), title (text), description, location,
+  start_time (timestamptz), end_time (timestamptz),
+  type (text), visible_to_contact_types (json array),
+  createdat, updatedat
+
+"UserEvent" — asistencia/inscripción a eventos
+  id (uuid), user_id (uuid → auth), event_id (uuid → "Event".id), createdat
+
+"OneOnOne" — sesiones 1:1 entre experience maker y founder
+  id (uuid), founder_id (uuid → "Person".id), em_id (uuid → "Person".id),
+  start_time (timestamp), end_time (timestamp), location, notes,
+  active_audio_url, active_audio_status, audio_transcript,
+  createdat, updatedat
+
+"OneOnOneAudioSubmission" — grabaciones de audio de 1:1
+  id (uuid), one_on_one_id (→ "OneOnOne".id), user_id,
+  storage_path, public_url, mime_type, file_size_bytes,
+  duration_sec, status, transcript_text, transcribed_at,
+  createdat, updatedat
+
+"Notification" — notificaciones individuales
+  id, user_id, event_id (nullable), message, is_read, sent_at, pushed_at
+
+"NotificationCampaign" — campañas masivas
+  id, title, message, event_id, filters_json (jsonb),
+  status (draft|sent|...), scheduled_for, created_by, sent_at,
+  target_count, created_notifications_count, pushed_count, error_message, created_at
+
+"NotificationCampaignRecipient" — destinatarios de campaña
+  id, campaign_id, user_id, notification_id,
+  delivery_status (pending|...), error_message, created_at, updated_at
+
+"PushSubscription" — suscripciones push de dispositivos
+  id, user_id, endpoint, p256dh, auth, user_agent, createdat, updatedat
+
+"home_daily_content" — contenido diario de la app
+  id, date (date), phase_label, badge_text, title, subtitle,
+  body_text, reflection_text, quote_text, quote_author, quote_cohort,
+  createdat, updatedat
+
+=== SEMÁNTICA ===
+
+- "founders" o startups → contact_type IS NULL
+- "experience makers" / "EMs" → contact_type = 'experience_maker'
+- "equipo" / "team" → contact_type = 'team'
+- "presente en el programa en fecha X" → arrival_date <= X AND departure_date >= X
+- Para unir personas a eventos → siempre via "UserEvent": "Person".user_id = "UserEvent".user_id
+
+=== REGLAS SQL ===
+
+1. Devuelve SOLO la sentencia SQL, sin markdown, sin comentarios, sin punto y coma final.
+2. Nunca uses SELECT *. Selecciona solo las columnas necesarias para responder.
+3. Para búsquedas de texto libre (nombres, sectores, ubicaciones) usa siempre:
+   unaccent(lower(columna)) ILIKE unaccent(lower('%valor%'))
+4. expertise_tags es jsonb array: busca con operador ?  (ej: expertise_tags ? 'Marketing')
+5. start_time y arrival_date son timestamptz. Para filtrar por día local:
+   (start_time AT TIME ZONE '{TIMEZONE}')::date = 'YYYY-MM-DD'
+6. Para mostrar hora local: to_char(start_time AT TIME ZONE '{TIMEZONE}', 'HH24:MI')
+7. Fechas relativas: hoy = CURRENT_DATE, mañana = CURRENT_DATE + 1, ayer = CURRENT_DATE - 1
+8. Pon siempre LIMIT (usa el que se te indique en el contexto del usuario).
+9. Si la pregunta no es sobre datos (es un saludo, pregunta general, etc.),
+   responde exactamente con: NO_SQL
+
+=== EJEMPLOS ===
+
+Pregunta: "¿Cuántos founders hay hoy en el programa?"
+SQL: SELECT COUNT(*) AS total FROM public."Person" WHERE contact_type IS NULL AND arrival_date <= CURRENT_DATE AND departure_date >= CURRENT_DATE
+
+Pregunta: "¿Qué eventos hay mañana?"
+SQL: SELECT title, to_char(start_time AT TIME ZONE '{TIMEZONE}', 'HH24:MI') AS hora, location FROM public."Event" WHERE (start_time AT TIME ZONE '{TIMEZONE}')::date = CURRENT_DATE + 1 ORDER BY start_time LIMIT 20
+
+Pregunta: "Hola, ¿cómo estás?"
+SQL: NO_SQL
+""".strip()
+
+SYSTEM_PROMPT_RESPUESTA = """
+Eres el asistente de datos de Decelera. Tu trabajo es convertir resultados de base de datos
+en respuestas claras y concisas en español para el equipo en Slack.
+
+Reglas:
+- Sé breve y directo. Usa listas solo si hay más de 3 items.
+- Nunca inventes datos. Solo usa lo que está en los resultados.
+- Si hay 0 resultados, di que no encontraste nada.
+- Usa formato Slack (negrita con *texto*, no markdown estándar).
+- Máximo 10 items en listas; si hay más, menciona el total y muestra los primeros.
+""".strip()
+
+# ---------------------------------------------------------------------------
+# Helpers: fechas
+# ---------------------------------------------------------------------------
 
 MESES_ES = {
-    "enero": 1,
-    "febrero": 2,
-    "marzo": 3,
-    "abril": 4,
-    "mayo": 5,
-    "junio": 6,
-    "julio": 7,
-    "agosto": 8,
-    "septiembre": 9,
-    "setiembre": 9,
-    "octubre": 10,
-    "noviembre": 11,
-    "diciembre": 12,
+    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4,
+    "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
+    "septiembre": 9, "setiembre": 9, "octubre": 10,
+    "noviembre": 11, "diciembre": 12,
 }
 
 
-def _normalizar_sql_generada(sql_query):
-    cleaned = (sql_query or "").strip()
-    if not cleaned:
-        return ""
+def resolver_fecha(texto: str) -> str | None:
+    """Extrae una fecha ISO 8601 de texto en español si la hay."""
+    t = texto.lower()
+    hoy = date.today()
 
-    # Si el modelo devuelve bloque markdown, extrae solo el contenido SQL.
-    block_match = re.search(r"```(?:sql)?\s*(.*?)\s*```", cleaned, flags=re.IGNORECASE | re.DOTALL)
-    if block_match:
-        cleaned = block_match.group(1).strip()
-
-    # Acepta ';' final (estilo común) pero elimina sentencias adicionales.
-    while cleaned.endswith(";"):
-        cleaned = cleaned[:-1].strip()
-
-    return cleaned
-
-
-def _asegurar_limit(sql_query, limit_default=20):
-    cleaned = _normalizar_sql_generada(sql_query)
-    if not cleaned:
-        return cleaned
-
-    # Si ya tiene LIMIT, no tocar.
-    if re.search(r"\blimit\s+\d+\b", cleaned, flags=re.IGNORECASE):
-        return cleaned
-
-    return f"{cleaned} LIMIT {limit_default}"
-
-
-def _limit_por_intencion(pregunta):
-    texto = (pregunta or "").lower()
-    if any(token in texto for token in ["todos", "todas", "lista completa", "completo"]):
-        return 200
-    return 50
-
-
-def _quiere_total_completo(pregunta):
-    texto = (pregunta or "").lower()
-    return any(token in texto for token in ["todos", "todas", "lista completa", "completo", "cuantos", "cuántos", "total"])
-
-
-def _sql_para_count_total(sql_query):
-    cleaned = _normalizar_sql_generada(sql_query)
-    # Quita LIMIT/OFFSET al final para obtener el total real.
-    base = re.sub(
-        r"\s+limit\s+\d+(\s+offset\s+\d+)?\s*$",
-        "",
-        cleaned,
-        flags=re.IGNORECASE,
+    # "25 de mayo" o "25 mayo"
+    m = re.search(
+        r"\b(\d{1,2})\s*(?:de\s+)?(enero|febrero|marzo|abril|mayo|junio|julio|agosto"
+        r"|septiembre|setiembre|octubre|noviembre|diciembre)\b", t
     )
-    base = re.sub(r"\s+offset\s+\d+\s*$", "", base, flags=re.IGNORECASE)
-    return f'SELECT COUNT(*) AS total FROM ({base}) AS "__subq__"'
-
-
-def _es_sql_segura_para_lectura(sql_query):
-    cleaned = _normalizar_sql_generada(sql_query)
-    if not cleaned:
-        return False
-    if ";" in cleaned:
-        # Evita inyección por múltiples sentencias.
-        return False
-    lowered = cleaned.lower()
-    if not (lowered.startswith("select") or lowered.startswith("with")):
-        return False
-
-    blocked_patterns = [
-        r"\binsert\b",
-        r"\bupdate\b",
-        r"\bdelete\b",
-        r"\bdrop\b",
-        r"\balter\b",
-        r"\btruncate\b",
-        r"\bcreate\b",
-        r"\bgrant\b",
-        r"\brevoke\b",
-    ]
-    return not any(re.search(pattern, lowered) for pattern in blocked_patterns)
-
-
-def _sql_fallback_sin_unaccent(sql_query):
-    cleaned = _normalizar_sql_generada(sql_query)
-    # Fallback simple y seguro:
-    # unaccent(lower(campo)) -> lower(campo)
-    # unaccent(lower('texto')) -> lower('texto')
-    # unaccent(campo) -> campo
-    fallback = re.sub(
-        r"unaccent\s*\(\s*lower\s*\((.*?)\)\s*\)",
-        r"lower(\1)",
-        cleaned,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    fallback = re.sub(
-        r"unaccent\s*\((.*?)\)",
-        r"\1",
-        fallback,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    return fallback
-
-
-def _ejecutar_sql_con_fallback_unaccent(sql_query):
-    db_res = supabase.rpc("exec_sql", {"query_text": sql_query}).execute()
-    error_obj = getattr(db_res, "error", None)
-    if not error_obj:
-        return db_res
-
-    error_text = str(error_obj).lower()
-    if "unaccent" not in error_text:
-        return db_res
-
-    sql_fallback = _sql_fallback_sin_unaccent(sql_query)
-    print("--- SQL FALLBACK (SIN UNACCENT) ---")
-    print(sql_fallback)
-    return supabase.rpc("exec_sql", {"query_text": sql_fallback}).execute()
-
-
-def _extraer_texto_mencion(event):
-    text = (event.get("text") or "").strip()
-    if not text:
-        return ""
-    # Elimina menciones tipo <@U123ABC>.
-    text = re.sub(r"<@[A-Z0-9]+>", "", text).strip()
-    return text
-
-
-def _resolver_fecha_explicita(pregunta):
-    texto = (pregunta or "").lower()
-
-    # 1) Captura: "25 de mayo" o "25 mayo".
-    match_mes = re.search(
-        r"\b(\d{1,2})\s*(?:de\s+)?(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)\b",
-        texto,
-    )
-    if match_mes:
-        day = int(match_mes.group(1))
-        month = MESES_ES[match_mes.group(2)]
-        year = date.today().year
+    if m:
         try:
-            return date(year, month, day).isoformat()
+            return date(hoy.year, MESES_ES[m.group(2)], int(m.group(1))).isoformat()
         except ValueError:
-            return None
+            pass
 
-    # 2) Captura: "25/05", "25-05", "25.05" con año opcional.
-    match_num = re.search(r"\b(\d{1,2})[\/\-.](\d{1,2})(?:[\/\-.](\d{2,4}))?\b", texto)
-    if match_num:
-        day = int(match_num.group(1))
-        month = int(match_num.group(2))
-        year_txt = match_num.group(3)
-        if year_txt:
-            year = int(year_txt)
+    # "25/05", "25-05", con año opcional
+    m = re.search(r"\b(\d{1,2})[\/\-.](\d{1,2})(?:[\/\-.](\d{2,4}))?\b", t)
+    if m:
+        try:
+            day, month = int(m.group(1)), int(m.group(2))
+            year = int(m.group(3)) if m.group(3) else hoy.year
             if year < 100:
                 year += 2000
-        else:
-            year = date.today().year
-        try:
             return date(year, month, day).isoformat()
         except ValueError:
-            return None
+            pass
 
-    # 3) Captura: "dia 25" o "día 25" sin mes -> asume mes actual.
-    match_dia = re.search(r"\bd[ií]a\s+(\d{1,2})\b", texto)
-    if match_dia:
-        day = int(match_dia.group(1))
-        today = date.today()
+    # "día 25" sin mes → mes actual
+    m = re.search(r"\bd[ií]a\s+(\d{1,2})\b", t)
+    if m:
         try:
-            return date(today.year, today.month, day).isoformat()
+            return date(hoy.year, hoy.month, int(m.group(1))).isoformat()
         except ValueError:
-            return None
+            pass
 
     return None
 
 
-def _hint_campos_solicitados(pregunta):
-    texto = (pregunta or "").lower()
-    pide_extras = any(
-        token in texto
-        for token in [
-            "email",
-            "mail",
-            "especialidad",
-            "especialidades",
-            "expertise",
-            "sector",
-            "startup",
-            "llegada",
-            "salida",
-            "fecha",
-            "telefono",
-            "contacto",
-        ]
-    )
-    if ("experience maker" in texto or "experience makers" in texto) and not pide_extras:
-        return (
-            "Si piden lista de Experience Makers sin campos adicionales, "
-            "selecciona solo full_name (no email ni expertise_tags)."
+# ---------------------------------------------------------------------------
+# Helpers: SQL
+# ---------------------------------------------------------------------------
+
+def limpiar_sql(texto: str) -> str:
+    """Extrae SQL limpio de la respuesta de Claude."""
+    texto = texto.strip()
+    m = re.search(r"```(?:sql)?\s*(.*?)\s*```", texto, re.IGNORECASE | re.DOTALL)
+    if m:
+        texto = m.group(1).strip()
+    return texto.rstrip(";").strip()
+
+
+def es_sql_segura(sql: str) -> bool:
+    """Solo permite SELECT y WITH...SELECT. Bloquea escritura y múltiples sentencias."""
+    if not sql:
+        return False
+    if ";" in sql:
+        return False
+    low = sql.lower().strip()
+    if not (low.startswith("select") or low.startswith("with")):
+        return False
+    bloqueadas = r"\b(insert|update|delete|drop|alter|truncate|create|grant|revoke|execute|copy)\b"
+    return not re.search(bloqueadas, low)
+
+
+def asegurar_limit(sql: str, limit: int = 50) -> str:
+    if not re.search(r"\blimit\s+\d+\b", sql, re.IGNORECASE):
+        sql = f"{sql} LIMIT {limit}"
+    return sql
+
+
+def quitar_limit(sql: str) -> str:
+    return re.sub(r"\s+limit\s+\d+(\s+offset\s+\d+)?\s*$", "", sql, flags=re.IGNORECASE).strip()
+
+
+def sql_para_count(sql: str) -> str:
+    base = quitar_limit(sql)
+    return f'SELECT COUNT(*) AS total FROM ({base}) AS _subq_'
+
+
+def sql_sin_unaccent(sql: str) -> str:
+    """Fallback: elimina unaccent() si la extensión no está disponible."""
+    sql = re.sub(r"unaccent\s*\(\s*lower\s*\((.*?)\)\s*\)", r"lower(\1)", sql, flags=re.IGNORECASE | re.DOTALL)
+    sql = re.sub(r"unaccent\s*\((.*?)\)", r"\1", sql, flags=re.IGNORECASE | re.DOTALL)
+    return sql
+
+
+# ---------------------------------------------------------------------------
+# Ejecución en Supabase
+# ---------------------------------------------------------------------------
+
+def ejecutar_sql(sql: str) -> tuple[list | None, str | None]:
+    """
+    Ejecuta SQL via RPC exec_sql.
+    Devuelve (filas, error). La función devuelve jsonb, que puede ser
+    una lista de objetos o un objeto con clave 'error'.
+    """
+    try:
+        res = supabase.rpc("exec_sql", {"query_text": sql}).execute()
+        data = res.data
+
+        # exec_sql devuelve jsonb — puede venir como string o ya parseado
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except json.JSONDecodeError:
+                return None, f"Respuesta inesperada de exec_sql: {data[:200]}"
+
+        # Si es un dict con clave 'error', hubo error en Postgres
+        if isinstance(data, dict) and "error" in data:
+            return None, data["error"]
+
+        # Éxito: debería ser una lista
+        if isinstance(data, list):
+            return data, None
+
+        # Fallback: envolver en lista si vino como dict sin error
+        return [data] if data else [], None
+
+    except Exception as e:
+        return None, str(e)
+
+
+def ejecutar_sql_con_fallback(sql: str) -> tuple[list | None, str | None]:
+    """Intenta con unaccent; si falla por esa causa, reintenta sin ella."""
+    filas, error = ejecutar_sql(sql)
+    if error and "unaccent" in error.lower():
+        log.warning("unaccent falló, reintentando sin ella")
+        sql_fb = sql_sin_unaccent(sql)
+        log.info(f"SQL FALLBACK:\n{sql_fb}")
+        filas, error = ejecutar_sql(sql_fb)
+    return filas, error
+
+
+# ---------------------------------------------------------------------------
+# Flujo principal: pregunta → SQL → resultado → respuesta
+# ---------------------------------------------------------------------------
+
+def flujo(pregunta: str) -> str:
+    fecha_iso = resolver_fecha(pregunta)
+    contexto_fecha = f"\nFecha detectada en la pregunta: {fecha_iso} (úsala literalmente)." if fecha_iso else ""
+    limit = 50 if any(w in pregunta.lower() for w in ["todos", "todas", "completo", "lista"]) else 20
+
+    # PASO 1 — Generar SQL
+    log.info(f"Pregunta: {pregunta}")
+    try:
+        res_sql = claude.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=400,
+            system=SYSTEM_PROMPT_SQL,
+            messages=[{
+                "role": "user",
+                "content": f"Pregunta: {pregunta}{contexto_fecha}\nLIMIT a usar: {limit}"
+            }]
         )
-    return ""
+    except Exception as e:
+        log.error(f"Error llamando a Claude (SQL): {e}")
+        return "No pude conectar con Claude para generar la consulta. Inténtalo de nuevo."
+
+    sql_raw = res_sql.content[0].text.strip() if res_sql.content else ""
+    log.info(f"Claude devolvió:\n{sql_raw}")
+
+    # Pregunta no relacionada con datos
+    if sql_raw.upper().startswith("NO_SQL"):
+        return (
+            "Hola! Soy el bot de datos de Decelera. "
+            "Puedes preguntarme cosas como: _¿Cuántos founders hay hoy?_, "
+            "_¿Qué eventos hay mañana?_ o _¿Quiénes son los experience makers esta semana?_"
+        )
+
+    sql = limpiar_sql(sql_raw)
+    sql = asegurar_limit(sql, limit)
+    log.info(f"SQL generado:\n{sql}")
+
+    if not es_sql_segura(sql):
+        log.warning(f"SQL bloqueada por seguridad: {sql}")
+        return "Solo puedo ejecutar consultas de lectura. Reformula la pregunta."
+
+    # PASO 2 — Ejecutar en Supabase
+    filas, error = ejecutar_sql_con_fallback(sql)
+
+    if error:
+        log.error(f"Error Supabase: {error}")
+        # Reintento con fecha explícita si la teníamos
+        if fecha_iso:
+            log.info("Reintentando SQL con fecha literal...")
+            try:
+                res_retry = claude.messages.create(
+                    model=CLAUDE_MODEL,
+                    max_tokens=400,
+                    system=SYSTEM_PROMPT_SQL,
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            f"Pregunta: {pregunta}\n"
+                            f"Usa obligatoriamente la fecha literal DATE '{fecha_iso}'.\n"
+                            f"Error anterior: {error}\n"
+                            f"LIMIT a usar: {limit}"
+                        )
+                    }]
+                )
+                sql_retry = limpiar_sql(res_retry.content[0].text.strip())
+                sql_retry = asegurar_limit(sql_retry, limit)
+                log.info(f"SQL RETRY:\n{sql_retry}")
+                if es_sql_segura(sql_retry):
+                    filas, error = ejecutar_sql_con_fallback(sql_retry)
+                    if error:
+                        return f"Error consultando la base de datos: {error}"
+            except Exception as e:
+                return f"Error en el reintento: {e}"
+        else:
+            return f"Error consultando la base de datos: {error}"
+
+    if filas is None:
+        return "No obtuve respuesta de la base de datos."
+
+    if len(filas) == 0:
+        return "No encontré resultados para esa consulta."
+
+    # Contar total real si puede haber truncado
+    total_global = None
+    if len(filas) >= limit:
+        sql_count = sql_para_count(sql)
+        filas_count, _ = ejecutar_sql_con_fallback(sql_count)
+        if filas_count and isinstance(filas_count, list) and filas_count:
+            total_global = filas_count[0].get("total")
+
+    # PASO 3 — Generar respuesta en lenguaje natural
+    resumen = json.dumps(filas[:10], ensure_ascii=False, default=str)
+    nota_truncado = (
+        f"\n(Mostrando {len(filas)} de {total_global} resultados totales.)"
+        if total_global and total_global > len(filas)
+        else f"\n(Total: {len(filas)} resultados.)"
+    )
+
+    try:
+        res_final = claude.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=500,
+            system=SYSTEM_PROMPT_RESPUESTA,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Pregunta original: {pregunta}\n"
+                    f"Resultados (JSON): {resumen}"
+                    f"{nota_truncado}"
+                )
+            }]
+        )
+        return res_final.content[0].text.strip() if res_final.content else "Sin respuesta."
+    except Exception as e:
+        log.error(f"Error generando respuesta final: {e}")
+        # Fallback determinista si Claude falla en el paso final
+        lineas = [f"Encontré *{len(filas)}* resultado(s):"]
+        for i, fila in enumerate(filas[:10], 1):
+            if isinstance(fila, dict):
+                partes = [f"{k}: {v}" for k, v in list(fila.items())[:4]]
+                lineas.append(f"{i}. " + " | ".join(partes))
+        if total_global and total_global > 10:
+            lineas.append(f"_(y {total_global - 10} más...)_")
+        return "\n".join(lineas)
 
 
-def _dividir_texto_slack(texto, max_chars=3200):
-    if not texto:
-        return [""]
+# ---------------------------------------------------------------------------
+# Helpers: Slack
+# ---------------------------------------------------------------------------
+
+def extraer_texto(event: dict, limpiar_menciones: bool = False) -> str:
+    texto = (event.get("text") or "").strip()
+    if limpiar_menciones:
+        texto = re.sub(r"<@[A-Z0-9]+>", "", texto).strip()
+    return texto
+
+
+def dividir_mensaje(texto: str, max_chars: int = 3000) -> list[str]:
     if len(texto) <= max_chars:
         return [texto]
-
-    partes = []
-    restante = texto
-    while len(restante) > max_chars:
-        corte = restante.rfind("\n", 0, max_chars)
+    partes, resto = [], texto
+    while len(resto) > max_chars:
+        corte = resto.rfind("\n", 0, max_chars)
         if corte < 0:
             corte = max_chars
-        partes.append(restante[:corte].strip())
-        restante = restante[corte:].strip()
-    if restante:
-        partes.append(restante)
+        partes.append(resto[:corte].strip())
+        resto = resto[corte:].strip()
+    if resto:
+        partes.append(resto)
     return partes
 
 
-def _extraer_texto_claude(response):
-    contenido = getattr(response, "content", None) or []
-    if not contenido:
-        return ""
-    primer_bloque = contenido[0]
-    return (getattr(primer_bloque, "text", "") or "").strip()
-
-
-def _respuesta_deterministica(datos_crudos, total_filas, total_global, limit_objetivo):
-    if isinstance(datos_crudos, dict) and datos_crudos.get("error"):
-        return f"Ha ocurrido un error tecnico consultando la base de datos: {datos_crudos.get('error')}"
-
-    if not isinstance(datos_crudos, list):
-        return "No pude interpretar correctamente el resultado de la consulta."
-
-    if len(datos_crudos) == 0:
-        return "No encontré resultados para esa consulta."
-
-    if total_global is not None:
-        cabecera = f"Te muestro {total_filas} de {total_global} resultados."
-    else:
-        cabecera = f"Te muestro {total_filas} resultados en esta respuesta (limite {limit_objetivo})."
-
-    lineas = [cabecera, ""]
-    max_columnas = 6
-    for idx, fila in enumerate(datos_crudos, start=1):
-        if isinstance(fila, dict):
-            columnas = list(fila.keys())[:max_columnas]
-            pares = [f"{col}: {fila.get(col)}" for col in columnas]
-            lineas.append(f"{idx}. " + " | ".join(pares))
-        else:
-            lineas.append(f"{idx}. {fila}")
-    return "\n".join(lineas)
-
-
-def _procesar_evento_pregunta(event, say, limpiar_menciones=False):
-    texto = (event.get("text") or "").strip()
-    if limpiar_menciones:
-        texto = _extraer_texto_mencion(event)
-
-    event_ts = event.get("ts")
-    channel_id = event.get("channel")
-
+def procesar_evento(event: dict, say, limpiar_menciones: bool = False):
+    texto = extraer_texto(event, limpiar_menciones)
     if not texto:
         say("Escríbeme una pregunta para poder ayudarte.")
         return
 
-    # Indicador visual sin mensaje: reacción sobre el mensaje del usuario.
+    channel_id = event.get("channel")
+    event_ts = event.get("ts")
+
+    # Reacción visual mientras procesa
     reaction_added = False
     if channel_id and event_ts:
         try:
-            app.client.reactions_add(
-                channel=channel_id,
-                timestamp=event_ts,
-                name="mag",
-            )
+            app.client.reactions_add(channel=channel_id, timestamp=event_ts, name="mag")
             reaction_added = True
-        except Exception as reaction_error:
-            print(f"No se pudo agregar reacción de progreso: {reaction_error}")
+        except Exception as e:
+            log.warning(f"No se pudo añadir reacción: {e}")
 
     try:
-        respuesta = flujo_pregunta_respuesta(texto)
+        respuesta = flujo(texto)
+    except Exception as e:
+        log.error(f"Error inesperado en flujo: {e}")
+        respuesta = "Ocurrió un error inesperado. Revisa los logs."
     finally:
-        if reaction_added and channel_id and event_ts:
+        if reaction_added:
             try:
-                app.client.reactions_remove(
-                    channel=channel_id,
-                    timestamp=event_ts,
-                    name="mag",
-                )
-            except Exception as reaction_error:
-                print(f"No se pudo quitar reacción de progreso: {reaction_error}")
+                app.client.reactions_remove(channel=channel_id, timestamp=event_ts, name="mag")
+            except Exception:
+                pass
 
-    # Respondemos en la conversación principal (sin hilo), fragmentando si es largo.
-    partes = _dividir_texto_slack(respuesta, max_chars=3200)
-    for idx, parte in enumerate(partes):
-        prefijo = f"(Parte {idx + 1}/{len(partes)})\n" if len(partes) > 1 else ""
+    partes = dividir_mensaje(respuesta)
+    for i, parte in enumerate(partes):
+        prefijo = f"_(Parte {i+1}/{len(partes)})_\n" if len(partes) > 1 else ""
         say(text=f"{prefijo}{parte}")
 
 
-def flujo_pregunta_respuesta(pregunta):
-    """
-    Proceso: Lenguaje Natural -> SQL -> Supabase -> Respuesta Humana
-    """
-    
-    # Prompt compacto para reducir coste, manteniendo reglas críticas.
-    esquema_detallado = """
-    Convierte lenguaje natural en SQL Postgres para un programa en Menorca.
-    Tablas:
-    - public."Person"(id, full_name, email, contact_type, expertise_tags, startup_id, arrival_date, departure_date)
-    - public."Startup"(id, name, sector, stage)
-    - public."Event"(id, title, description, location, start_time)
-    - public."UserEvent"(user_id, event_id)
-    Joins:
-    - Person.startup_id = Startup.id
-    - UserEvent.user_id = Person.id
-    - UserEvent.event_id = Event.id
-    - Para relacion evento-persona usa SIEMPRE UserEvent + Person.
-    Semantica:
-    - "quien esta", "quienes estan", "en Menorca", "en el programa" => personas presentes por rango de fechas.
-    - Presente en fecha X => arrival_date <= X AND (departure_date IS NULL OR departure_date >= X).
-    - "a que hora", "horario", "eventos a las 18:00" => consultas sobre public."Event".start_time.
-    Reglas de fechas:
-    - "hoy" => CURRENT_DATE.
-    - "manana" => CURRENT_DATE + INTERVAL '1 day'.
-    - "ayer" => CURRENT_DATE - INTERVAL '1 day'.
-    - "dia 24" sin mes/anio => dia 24 del mes actual:
-      (date_trunc('month', CURRENT_DATE)::date + INTERVAL '23 day')::date
-    - Si hay mes explicito (ej: "24 de mayo"), usa esa fecha del anio actual.
-    Reglas SQL:
-    - Usa SIEMPRE nombres con comillas dobles.
-    - "Experience Makers" => contact_type = 'experience_maker'.
-    - Nunca uses SELECT *. Selecciona solo columnas necesarias para responder.
-    - Si el usuario no pide campos concretos, devuelve el minimo util (ejemplo en personas: full_name).
-    - Para textos usa ILIKE; para expertise_tags usa operador ?.
-    - En busquedas por nombres/texto libre (personas, startups, eventos, ubicacion), haz comparacion sin mayusculas y sin tildes:
-      unaccent(lower(columna)) ILIKE unaccent(lower('%valor%')).
-    - Si comparas igualdad por nombre, tambien sin tildes/mayusculas:
-      unaccent(lower(columna)) = unaccent(lower('valor')).
-    - Aplica esto especialmente a: full_name, name, title, location, sector.
-    - Si no se puede usar unaccent, usa fallback con lower(columna) ILIKE lower('%valor%').
-    - start_time es timestamptz. Para filtrar por dia local, usa (start_time AT TIME ZONE 'Europe/Madrid')::date.
-    - Para mostrar hora local, usa to_char(start_time AT TIME ZONE 'Europe/Madrid', 'HH24:MI') AS hora_local.
-    - Si preguntan "a las HH:MM", compara to_char(start_time AT TIME ZONE 'Europe/Madrid', 'HH24:MI') = 'HH:MM'.
-    - Devuelve una sola consulta SELECT (o WITH...SELECT), sin markdown ni comentarios, LIMIT 20.
-    Ejemplo:
-    - Pregunta: "quien esta el dia 24"
-    - SQL: SELECT full_name FROM public."Person" WHERE arrival_date <= (date_trunc('month', CURRENT_DATE)::date + INTERVAL '23 day')::date AND (departure_date IS NULL OR departure_date >= (date_trunc('month', CURRENT_DATE)::date + INTERVAL '23 day')::date) LIMIT 20
-    """
-
-    try:
-        limit_objetivo = _limit_por_intencion(pregunta)
-        fecha_explicita_iso = _resolver_fecha_explicita(pregunta)
-        contexto_fecha = (
-            f"\nFecha detectada en la pregunta (usar literalmente): {fecha_explicita_iso}."
-            if fecha_explicita_iso
-            else ""
-        )
-        contexto_campos = _hint_campos_solicitados(pregunta)
-
-        # PASO A: Generar el SQL
-        res_sql = claude.messages.create(
-            model=model_claude,
-            max_tokens=180,
-            system=esquema_detallado,
-            messages=[{
-                "role": "user",
-                "content": f"Genera el SQL para: {pregunta}.{contexto_fecha}\n{contexto_campos}",
-            }]
-        )
-        sql_query = _asegurar_limit(_extraer_texto_claude(res_sql), limit_default=limit_objetivo)
-        
-        # Log para debug en Railway
-        print(f"--- SQL GENERADO ---\n{sql_query}\n")
-
-        if not _es_sql_segura_para_lectura(sql_query):
-            print(f"SQL BLOQUEADA POR SEGURIDAD: {sql_query}")
-            return (
-                "Solo puedo ejecutar consultas de lectura seguras (SELECT sin "
-                "múltiples sentencias). Reformula la pregunta, por favor."
-            )
-
-        # PASO B: Ejecutar en Supabase vía RPC
-        db_res = _ejecutar_sql_con_fallback_unaccent(sql_query)
-        if getattr(db_res, "error", None):
-            print(f"ERROR SUPABASE RPC: {db_res.error}")
-            datos_crudos = {"error": str(db_res.error)}
-        else:
-            datos_crudos = getattr(db_res, "data", None)
-            if datos_crudos is None:
-                datos_crudos = []
-
-        # Fallback barato: si hay fecha clara y no hay resultados,
-        # pide una segunda SQL más literal con esa fecha.
-        if (
-            not getattr(db_res, "error", None)
-            and isinstance(datos_crudos, list)
-            and len(datos_crudos) == 0
-            and fecha_explicita_iso
-        ):
-            print("Reintentando SQL por resultado vacio con fecha explicita...")
-            res_sql_retry = claude.messages.create(
-                model=model_claude,
-                max_tokens=120,
-                system=esquema_detallado,
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        f"Reformula la consulta SQL para: {pregunta}. "
-                        f"Usa obligatoriamente la fecha literal DATE '{fecha_explicita_iso}'. "
-                        f"Manten una sola sentencia SELECT y LIMIT {limit_objetivo}."
-                    )
-                }]
-            )
-            sql_query_retry = _asegurar_limit(_extraer_texto_claude(res_sql_retry), limit_default=limit_objetivo)
-            print(f"--- SQL RETRY ---\n{sql_query_retry}\n")
-            if _es_sql_segura_para_lectura(sql_query_retry):
-                db_res_retry = _ejecutar_sql_con_fallback_unaccent(sql_query_retry)
-                if getattr(db_res_retry, "error", None):
-                    print(f"ERROR SUPABASE RPC RETRY: {db_res_retry.error}")
-                else:
-                    datos_retry = getattr(db_res_retry, "data", None)
-                    if isinstance(datos_retry, list):
-                        datos_crudos = datos_retry
-
-        total_global = None
-        # Calcula total real cuando puede haber truncado por LIMIT,
-        # o cuando la pregunta requiere totales/listados completos.
-        necesita_total_global = (
-            isinstance(datos_crudos, list)
-            and _es_sql_segura_para_lectura(sql_query)
-            and (
-                _quiere_total_completo(pregunta)
-                or len(datos_crudos) >= limit_objetivo
-            )
-        )
-        if necesita_total_global:
-            try:
-                sql_count = _sql_para_count_total(sql_query)
-                print(f"--- SQL COUNT ---\n{sql_count}\n")
-                db_res_count = _ejecutar_sql_con_fallback_unaccent(sql_count)
-                if not getattr(db_res_count, "error", None):
-                    count_data = getattr(db_res_count, "data", None)
-                    if isinstance(count_data, list) and count_data:
-                        total_global = count_data[0].get("total")
-            except Exception as count_error:
-                print(f"ERROR COUNT TOTAL: {count_error}")
-
-        # PASO C: Respuesta final (determinista por robustez/coste).
-        total_filas = len(datos_crudos) if isinstance(datos_crudos, list) else None
-        respuesta_base = _respuesta_deterministica(
-            datos_crudos=datos_crudos,
-            total_filas=total_filas,
-            total_global=total_global,
-            limit_objetivo=limit_objetivo,
-        )
-
-        if not USE_CLAUDE_FOR_FINAL_TEXT:
-            return respuesta_base
-
-        prompt_humano = (
-            f'Pregunta: "{pregunta}"\n'
-            f"Respuesta base (no inventar datos): {respuesta_base}\n"
-            "Reescribe en espanol, breve y clara, sin cambiar numeros."
-        )
-        res_final = claude.messages.create(
-            model=model_claude,
-            max_tokens=180,
-            messages=[{"role": "user", "content": prompt_humano}]
-        )
-        return _extraer_texto_claude(res_final) or respuesta_base
-
-    except Exception as e:
-        print(f"ERROR EN EL FLUJO: {e}")
-        return f"Lo siento, tuve un problema al procesar esa consulta. (Error: {str(e)})"
-
-# --- EVENTO DE SLACK ---
+# ---------------------------------------------------------------------------
+# Eventos de Slack
+# ---------------------------------------------------------------------------
 
 @app.event("app_mention")
-def handle_mentions(event, say):
-    _procesar_evento_pregunta(event, say, limpiar_menciones=True)
+def handle_mention(event, say):
+    procesar_evento(event, say, limpiar_menciones=True)
 
 
 @app.event("message")
-def handle_private_messages(event, say):
-    # Solo procesa DMs del usuario para evitar ruido y loops.
+def handle_dm(event, say):
     if event.get("channel_type") != "im":
         return
     if event.get("bot_id") or event.get("subtype"):
         return
+    procesar_evento(event, say, limpiar_menciones=False)
 
-    _procesar_evento_pregunta(event, say, limpiar_menciones=False)
 
-# --- RUTAS PARA RAILWAY ---
+# ---------------------------------------------------------------------------
+# Rutas Flask (Railway)
+# ---------------------------------------------------------------------------
 
 @flask_app.route("/slack/events", methods=["POST"])
 def slack_events():
     return handler.handle(request)
+
+
+@flask_app.route("/health", methods=["GET"])
+def health():
+    return {"status": "ok", "model": CLAUDE_MODEL}, 200
+
 
 if __name__ == "__main__":
     flask_app.run(port=int(os.environ.get("PORT", 3000)))

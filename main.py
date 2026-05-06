@@ -36,14 +36,14 @@ missing = [v for v in REQUIRED_ENV_VARS if not os.getenv(v)]
 if missing:
     raise RuntimeError(f"Faltan variables de entorno: {', '.join(missing)}")
 
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Madrid")
 
 # ---------------------------------------------------------------------------
 # Clientes
 # ---------------------------------------------------------------------------
 
-claude = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+claude = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"), max_retries=4)
 supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
 app = App(token=os.getenv("SLACK_BOT_TOKEN"), signing_secret=os.getenv("SLACK_SIGNING_SECRET"))
@@ -333,6 +333,8 @@ def flujo(pregunta: str) -> str:
         )
     except Exception as e:
         log.error(f"Error llamando a Claude (SQL): {e}")
+        if "529" in str(e) or "overloaded" in str(e).lower():
+            return "Claude está saturado ahora mismo. Espera unos segundos e inténtalo de nuevo."
         return "No pude conectar con Claude para generar la consulta. Inténtalo de nuevo."
 
     sql_raw = res_sql.content[0].text.strip() if res_sql.content else ""

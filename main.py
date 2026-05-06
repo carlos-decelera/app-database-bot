@@ -36,7 +36,7 @@ missing = [v for v in REQUIRED_ENV_VARS if not os.getenv(v)]
 if missing:
     raise RuntimeError(f"Faltan variables de entorno: {', '.join(missing)}")
 
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Madrid")
 
 # ---------------------------------------------------------------------------
